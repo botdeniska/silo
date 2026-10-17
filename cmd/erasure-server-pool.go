@@ -640,6 +640,12 @@ func (z *erasureServerPools) getPoolIdx(ctx context.Context, bucket, object stri
 
 // getWritePoolIdx keeps the write-allocation policy when the caller already
 // holds the pools-layer object lock and must not reacquire a set read lock.
+//
+// Writes to an existing object go to the pool that holds its latest version,
+// so versions of one object do not spread over pools and an overwrite does
+// not leave a stale copy behind. When that version is readable, the pool must
+// also pass the free drive threshold, or the write goes to another pool as a
+// new object would.
 func (z *erasureServerPools) getWritePoolIdx(ctx context.Context, bucket, object string, size int64, noLock bool) (idx int, err error) {
 	pinfo, _, err := z.getPoolInfoExistingWithOpts(ctx, bucket, object, ObjectOptions{
 		NoLock:             noLock,
@@ -652,7 +658,7 @@ func (z *erasureServerPools) getWritePoolIdx(ctx context.Context, bucket, object
 	}
 
 	idx = pinfo.Index
-	if isErrObjectNotFound(err) || pinfo.Err == nil {
+	if isErrObjectNotFound(err) || (pinfo.Err == nil && !z.poolHasSpaceFor(ctx, idx, bucket, object, size)) {
 		// will generate a temp object
 		idx = z.getAvailablePoolIdx(ctx, bucket, object, size)
 		if idx < 0 {
@@ -661,6 +667,18 @@ func (z *erasureServerPools) getWritePoolIdx(ctx context.Context, bucket, object
 	}
 
 	return idx, nil
+}
+
+// poolHasSpaceFor applies the hard free space checks of
+// getServerPoolsAvailableSpace to the set of pool idx that would hold object.
+// The reserve that steers new objects to emptier pools does not apply.
+func (z *erasureServerPools) poolHasSpaceFor(ctx context.Context, idx int, bucket, object string, size int64) bool {
+	if isMinioMetaBucketName(bucket) {
+		return true
+	}
+	disks := z.serverPools[idx].getHashedSet(object).getDisks()
+	ok, err := hasSpaceFor(getDiskInfos(ctx, disks...), size)
+	return err == nil && ok
 }
 
 func (z *erasureServerPools) Shutdown(ctx context.Context) error {
