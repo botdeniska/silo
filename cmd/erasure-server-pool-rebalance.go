@@ -671,6 +671,9 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 							SkipRebalancing:   true, // make sure we skip the decommissioned pool
 							NoAuditLog:        true,
 						})
+					if isDataMovementSuperseded(err) {
+						err = nil
+					}
 					// This can happen when rebalance stop races with ongoing rebalance workers.
 					// These rebalance failures can be ignored.
 					if err != nil {
@@ -719,7 +722,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 						continue
 					}
 
-					if err = z.rebalanceObject(ctx, poolIdx, bucket, gr); err != nil {
+					if err = z.rebalanceObject(ctx, poolIdx, bucket, gr); err != nil && !isDataMovementSuperseded(err) {
 						// This can happen when rebalance stop races with ongoing rebalance workers.
 						// These rebalance failures can be ignored.
 						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
@@ -863,6 +866,12 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, poolIdx int, b
 	}
 
 	if oi.isMultipart() {
+		// Completion repeats this check under the object write lock.
+		if _, err := z.checkDataMovementCopies(ctx, bucket, encodeDirObject(oi.Name), ObjectOptions{
+			VersionID: oi.VersionID, MTime: oi.ModTime, SrcPoolIdx: poolIdx,
+		}); err != nil {
+			return err
+		}
 		res, err := z.NewMultipartUpload(ctx, bucket, oi.Name, ObjectOptions{
 			VersionID:    oi.VersionID,
 			UserDefined:  migrationObjectMetadata(oi),
@@ -900,6 +909,8 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, poolIdx int, b
 			}
 		}
 		_, err = z.CompleteMultipartUpload(ctx, bucket, oi.Name, res.UploadID, parts, ObjectOptions{
+			VersionID:    oi.VersionID,
+			SrcPoolIdx:   poolIdx,
 			DataMovement: true,
 			MTime:        oi.ModTime,
 			NoAuditLog:   true,
@@ -1010,7 +1021,10 @@ const (
 	rebalanceMetricSaveMetadata
 )
 
-var errDataMovementSrcDstPoolSame = errors.New("source and destination pool are the same")
+var (
+	errDataMovementSrcDstPoolSame = errors.New("source and destination pool are the same")
+	errDataMovementSuperseded     = errors.New("another pool holds a newer copy")
+)
 
 func rebalanceTrace(r rebalanceMetric, poolIdx int, startTime time.Time, duration time.Duration, err error, path string, sz int64) madmin.TraceInfo {
 	var errStr string

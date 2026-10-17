@@ -1183,6 +1183,14 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 		opts.CheckPrecondFn = nil
 	}
 
+	if opts.DataMovement {
+		resolve, err := z.checkDataMovementCopies(ctx, bucket, object, opts)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		opts.replicaObjectInfo = resolve
+	}
+
 	idx, err := z.getWritePoolIdx(ctx, bucket, object, data.Size(), true)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -1202,7 +1210,7 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 	}
 	// Public overwrites need all pools for Object Lock. Unaddressed replica
 	// callbacks retain their set-local reads unless reconciliation is needed.
-	if opts.ReplicaLockReconcile || !opts.ReplicationRequest {
+	if opts.replicaObjectInfo == nil && (opts.ReplicaLockReconcile || !opts.ReplicationRequest) {
 		opts.replicaObjectInfo = z.replicaObjectInfo
 	}
 	oi, err := z.serverPools[idx].PutObject(ctx, bucket, object, data, opts)
@@ -1339,6 +1347,9 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 	}
 
 	if opts.DataMovement {
+		if _, err := z.checkDataMovementCopies(ctx, bucket, object, gopts); err != nil {
+			return pinfo.ObjInfo, err
+		}
 		objInfo, err = z.serverPools[pinfo.Index].DeleteObject(ctx, bucket, object, opts)
 		objInfo.Name = decodeDirObject(object)
 		return objInfo, err
@@ -2248,6 +2259,13 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 			}
 			opts.CheckPrecondFn = nil
 		}
+		if opts.DataMovement {
+			resolve, err := z.checkDataMovementCopies(ctx, bucket, encodeDirObject(object), opts)
+			if err != nil {
+				return ObjectInfo{}, err
+			}
+			opts.replicaObjectInfo = resolve
+		}
 	}
 
 	// Hold write locks to verify uploaded parts, also disallows any
@@ -2267,7 +2285,7 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 	if opts.ReplicaLockReconcile || opts.DataMovement {
 		opts.ReplicaLockReconcile = true
 	}
-	if opts.ReplicaLockReconcile || !opts.ReplicationRequest {
+	if opts.replicaObjectInfo == nil && (opts.ReplicaLockReconcile || !opts.ReplicationRequest) {
 		opts.replicaObjectInfo = z.replicaObjectInfo
 	}
 
@@ -3257,6 +3275,11 @@ func (z *erasureServerPools) DecomTieredObject(ctx context.Context, bucket, obje
 		ctx = lkctx.Context()
 		defer ns.Unlock(lkctx)
 		opts.NoLock = true
+	}
+	if opts.DataMovement {
+		if _, err := z.checkDataMovementCopies(ctx, bucket, object, opts); err != nil {
+			return err
+		}
 	}
 	idx, err := z.getPoolIdxNoLock(ctx, bucket, object, fi.Size)
 	if err != nil {

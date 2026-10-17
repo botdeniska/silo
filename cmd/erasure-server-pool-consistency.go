@@ -62,6 +62,51 @@ func (z *erasureServerPools) objectPoolInfos(ctx context.Context, bucket, object
 	return copies, nil
 }
 
+// checkDataMovementCopies rejects moving a version when another pool holds a
+// newer copy of it, which reads return instead. A cross-pool overwrite can
+// leave such a copy, and a client write can add one while the move copies.
+// An equal ModTime marks the same write, e.g. after an interrupted move, and
+// is moved as before. While the caller holds the pools-layer object lock, the
+// returned resolver serves the set layer's reconciliation of this version from
+// the same reads. Without opts.NoLock it takes the read lock itself.
+func (z *erasureServerPools) checkDataMovementCopies(ctx context.Context, bucket, object string, opts ObjectOptions) (GetObjectInfoFn, error) {
+	if opts.MTime.IsZero() {
+		// The set layer would stamp the moved copy as the newest one.
+		return nil, errInvalidArgument
+	}
+	if !opts.NoLock {
+		lk := z.NewNSLock(bucket, object)
+		lkctx, err := lk.GetRLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return nil, err
+		}
+		ctx = lkctx.Context()
+		defer lk.RUnlock(lkctx)
+	}
+	versionID := opts.VersionID
+	if versionID == "" {
+		versionID = nullVersionID
+	}
+	copies, err := z.objectPoolInfos(ctx, bucket, object, ObjectOptions{VersionID: versionID, NoAuditLog: true})
+	if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+		return nil, err
+	}
+	for _, copy := range copies {
+		if copy.Index != opts.SrcPoolIdx && copy.ObjInfo.ModTime.After(opts.MTime) {
+			return nil, DataMovementOverwriteErr{Bucket: bucket, Object: object, VersionID: opts.VersionID, Err: errDataMovementSuperseded}
+		}
+	}
+	return func(ctx context.Context, b, o string, ropts ObjectOptions) (ObjectInfo, error) {
+		if ropts.VersionID == "" {
+			ropts.VersionID = nullVersionID
+		}
+		if b != bucket || o != object || ropts.VersionID != versionID {
+			return z.replicaObjectInfo(ctx, b, o, ropts)
+		}
+		return replicaCopiesInfo(copies, err, bucket, object, versionID)
+	}, nil
+}
+
 // Healing also commits object metadata. Both queued healing and drive healing
 // must use the same namespace as pooled writes, rather than racing them under
 // a destination set's independent namespace.
@@ -137,11 +182,15 @@ func (z *erasureServerPools) replicaObjectInfo(ctx context.Context, bucket, obje
 		opts.VersionID = nullVersionID
 	}
 	copies, err := z.objectPoolInfos(ctx, bucket, object, opts)
+	return replicaCopiesInfo(copies, err, bucket, object, opts.VersionID)
+}
+
+func replicaCopiesInfo(copies []PoolObjInfo, err error, bucket, object, versionID string) (ObjectInfo, error) {
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 	if copies[0].ObjInfo.DeleteMarker {
-		return copies[0].ObjInfo, MethodNotAllowed{Bucket: bucket, Object: decodeDirObject(object), VersionID: opts.VersionID}
+		return copies[0].ObjInfo, MethodNotAllowed{Bucket: bucket, Object: decodeDirObject(object), VersionID: versionID}
 	}
 	return mergedPoolObjectInfo(copies), nil
 }

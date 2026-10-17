@@ -616,6 +616,12 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, idx int, bu
 	}
 
 	if objInfo.isMultipart() {
+		// Completion repeats this check under the object write lock.
+		if _, err := z.checkDataMovementCopies(ctx, bucket, encodeDirObject(objInfo.Name), ObjectOptions{
+			VersionID: objInfo.VersionID, MTime: objInfo.ModTime, SrcPoolIdx: idx,
+		}); err != nil {
+			return err
+		}
 		res, err := z.NewMultipartUpload(ctx, bucket, objInfo.Name, ObjectOptions{
 			VersionID:    objInfo.VersionID,
 			UserDefined:  migrationObjectMetadata(objInfo),
@@ -656,6 +662,7 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, idx int, bu
 			}
 		}
 		_, err = z.CompleteMultipartUpload(ctx, bucket, objInfo.Name, res.UploadID, parts, ObjectOptions{
+			VersionID:    objInfo.VersionID,
 			SrcPoolIdx:   idx,
 			DataMovement: true,
 			MTime:        objInfo.ModTime,
@@ -870,6 +877,9 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 							SkipDecommissioned: true, // make sure we skip the decommissioned pool
 							NoAuditLog:         true,
 						})
+					if isDataMovementSuperseded(err) {
+						err = nil
+					}
 					if err != nil {
 						// This can happen when rebalance stop races with ongoing rebalance workers.
 						// These rebalance failures can be ignored.
@@ -898,17 +908,19 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 				// gr.Close() is ensured by decommissionObject().
 				for range 3 {
 					if version.IsRemote() {
-						if err := z.DecomTieredObject(ctx, bi.Name, version.Name, version, ObjectOptions{
+						err := z.DecomTieredObject(ctx, bi.Name, version.Name, version, ObjectOptions{
 							VersionID:    versionID,
 							MTime:        version.ModTime,
 							UserDefined:  version.Metadata,
 							SrcPoolIdx:   idx,
 							DataMovement: true,
-						}); err != nil {
-							if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
-								ignore = true
-								stopFn(0, nil)
-							}
+						})
+						if isDataMovementSuperseded(err) {
+							err = nil
+						}
+						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
+							ignore = true
+							stopFn(0, nil)
 						}
 						if !ignore {
 							stopFn(version.Size, err)
@@ -949,7 +961,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 						stopFn(version.Size, err)
 						continue
 					}
-					if err = z.decommissionObject(ctx, idx, bi.Name, gr); err != nil {
+					if err = z.decommissionObject(ctx, idx, bi.Name, gr); err != nil && !isDataMovementSuperseded(err) {
 						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
 							ignore = true
 							stopFn(0, nil)
