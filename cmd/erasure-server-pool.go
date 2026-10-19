@@ -390,7 +390,16 @@ func (p serverPoolsAvailableSpace) FilterMaxUsed(maxUsed int) {
 // getAvailablePoolIdx will return an index that can hold size bytes.
 // -1 is returned if no serverPools have available space for the size given.
 func (z *erasureServerPools) getAvailablePoolIdx(ctx context.Context, bucket, object string, size int64) int {
+	return z.getAvailablePoolIdxExcept(ctx, bucket, object, size, -1)
+}
+
+// getAvailablePoolIdxExcept is getAvailablePoolIdx with pool skip left out
+// of the choice, and of the reserve filter. skip < 0 leaves out no pool.
+func (z *erasureServerPools) getAvailablePoolIdxExcept(ctx context.Context, bucket, object string, size int64, skip int) int {
 	serverPools := z.getServerPoolsAvailableSpace(ctx, bucket, object, size)
+	if skip >= 0 {
+		serverPools[skip].Available = 0
+	}
 	serverPools.FilterMaxUsed(100 - (100 * diskReserveFraction))
 	total := serverPools.TotalAvailable()
 	if total == 0 {
@@ -643,9 +652,10 @@ func (z *erasureServerPools) getPoolIdx(ctx context.Context, bucket, object stri
 //
 // Writes to an existing object go to the pool that holds its latest version,
 // so versions of one object do not spread over pools and an overwrite does
-// not leave a stale copy behind. When that version is readable, the pool must
-// also pass the free drive threshold, or the write goes to another pool as a
-// new object would.
+// not leave a stale copy behind. When that version is readable, the object's
+// set must also have write quorum and pass the free drive threshold, or the
+// write goes to another pool. The choice is made before the request body is
+// read, so the write cannot move once the set rejects it.
 func (z *erasureServerPools) getWritePoolIdx(ctx context.Context, bucket, object string, size int64, noLock bool) (idx int, err error) {
 	pinfo, _, err := z.getPoolInfoExistingWithOpts(ctx, bucket, object, ObjectOptions{
 		NoLock:             noLock,
@@ -658,15 +668,57 @@ func (z *erasureServerPools) getWritePoolIdx(ctx context.Context, bucket, object
 	}
 
 	idx = pinfo.Index
-	if isErrObjectNotFound(err) || (pinfo.Err == nil && !z.poolHasSpaceFor(ctx, idx, bucket, object, size)) {
+	switch {
+	case isErrObjectNotFound(err):
 		// will generate a temp object
 		idx = z.getAvailablePoolIdx(ctx, bucket, object, size)
-		if idx < 0 {
-			return -1, toObjectErr(errDiskFull)
+	case pinfo.Err == nil:
+		writable := z.poolHasWriteQuorum(idx, object)
+		hasSpace := z.poolHasSpaceFor(ctx, idx, bucket, object, size)
+		if writable && hasSpace {
+			return idx, nil
 		}
+		home := idx
+		idx = z.getAvailablePoolIdxExcept(ctx, bucket, object, size, home)
+		if idx < 0 && hasSpace {
+			// No other pool has room: the object's set reports the write
+			// quorum error.
+			return home, nil
+		}
+	}
+	if idx < 0 {
+		return -1, toObjectErr(errDiskFull)
 	}
 
 	return idx, nil
+}
+
+// poolHasWriteQuorum reports whether the set of pool idx that would hold
+// object has the online drives a standard class putObject or
+// newMultipartUpload needs. A version can stay readable without them: EC 8+8
+// reads with 8 of 16 drives but writes with 9.
+func (z *erasureServerPools) poolHasWriteQuorum(idx int, object string) bool {
+	set := z.serverPools[idx].getHashedSet(object)
+	disks := set.getDisks()
+	var online int
+	for _, disk := range disks {
+		if disk != nil && disk.IsOnline() {
+			online++
+		}
+	}
+	if globalStorageClass.AvailabilityOptimized() {
+		// Offline drives raise the parity, up to half of the set.
+		return len(disks)-online < (len(disks)+1)/2
+	}
+	parity := globalStorageClass.GetParityForSC("")
+	if parity < 0 {
+		parity = set.defaultParityCount
+	}
+	quorum := len(disks) - parity
+	if quorum == parity {
+		quorum++
+	}
+	return online >= quorum
 }
 
 // poolHasSpaceFor applies the hard free space checks of

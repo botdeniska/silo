@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"slices"
 	"testing"
+
+	"github.com/minio/minio/internal/config/storageclass"
 )
 
 // Report a fixed fill level for allocation only; metadata and data use the
@@ -90,6 +92,36 @@ func placementPut(t *testing.T, z *erasureServerPools, bucket, object, body stri
 	return oi
 }
 
+func placementMultipartPut(t *testing.T, z *erasureServerPools, bucket, object, body string, opts ObjectOptions) ObjectInfo {
+	t.Helper()
+	mp, err := z.NewMultipartUpload(t.Context(), bucket, object, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part, err := z.PutObjectPart(t.Context(), bucket, object, mp.UploadID, 1,
+		mustGetPutObjReader(t, bytes.NewBufferString(body), int64(len(body)), "", ""), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oi, err := z.CompleteMultipartUpload(t.Context(), bucket, object, mp.UploadID,
+		[]CompletePart{{PartNumber: 1, ETag: part.ETag}}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return oi
+}
+
+// Take the first n drives of the set that holds object offline.
+func placementOffline(pool *erasureSets, object string, n int) func() {
+	var i int
+	return conditionalPutSwapDisks(pool, object, func(disk StorageAPI) StorageAPI {
+		if i++; i <= n {
+			return nil
+		}
+		return disk
+	})
+}
+
 func TestPoolsOverwriteStaysInObjectPool(t *testing.T) {
 	for _, mode := range []string{"unversioned", "versioned", "suspended"} {
 		t.Run(mode, func(t *testing.T) {
@@ -142,6 +174,67 @@ func TestPoolsOverwriteFullObjectPool(t *testing.T) {
 		mustGetPutObjReader(t, bytes.NewBufferString("v2"), 2, "", ""), opts)
 	if !errors.As(err, &StorageFull{}) {
 		t.Fatalf("overwrite with all pools full: got %v, want StorageFull", err)
+	}
+}
+
+// An EC 8+8 version stays readable with 8 of 16 drives online, while a write
+// needs more of them. The overwrite must go to another pool before the
+// request body is read, and the object's set may only report the write quorum
+// error when no other pool has room.
+func TestPoolsOverwriteObjectSetWithoutWriteQuorum(t *testing.T) {
+	for _, tc := range []struct {
+		optimize string
+		offline  int
+	}{
+		// Offline drives raise the parity of the write up to 8+8, which
+		// needs 9 drives.
+		{"availability", 8},
+		// The write keeps the standard 12+4 and needs 12 drives.
+		{"capacity", 5},
+	} {
+		t.Run(tc.optimize, func(t *testing.T) {
+			z, bucket := consistencyPools(t)
+			previous := globalStorageClass
+			globalStorageClass.Update(storageclass.Config{Standard: storageclass.StorageClass{Parity: 4}, Optimize: tc.optimize})
+			t.Cleanup(func() { globalStorageClass.Update(previous) })
+			opts := ObjectOptions{Versioned: true}
+			for home := range z.serverPools {
+				other := 1 - home
+				object, full := fmt.Sprintf("quorum-%d", home), fmt.Sprintf("quorum-full-%d", home)
+				for _, key := range []string{object, full} {
+					putConsistencyObject(t, z, bucket, key, home, "v0", ObjectOptions{Versioned: true, MaxParity: true})
+				}
+
+				var put, multipart ObjectInfo
+				func() {
+					// The other pool is above the reserve, so capacity-weighted
+					// selection alone would pick the object's pool again.
+					defer placementHomeCapacity(z, object, other, 90)()
+					defer placementOffline(z.serverPools[home], object, tc.offline)()
+					put = placementPut(t, z, bucket, object, "v1", opts)
+					multipart = placementMultipartPut(t, z, bucket, object, "v2", opts)
+				}()
+				for _, versionID := range []string{put.VersionID, multipart.VersionID} {
+					if got := placementPools(t, z, bucket, object, versionID); !slices.Equal(got, []int{other}) {
+						t.Errorf("%s version %s is in pools %v, want [%d]", object, versionID, got, other)
+					}
+				}
+
+				func() {
+					defer placementHomeCapacity(z, full, other, 100)()
+					defer placementOffline(z.serverPools[home], full, tc.offline)()
+					_, err := z.PutObject(t.Context(), bucket, full,
+						mustGetPutObjReader(t, bytes.NewBufferString("v1"), 2, "", ""), opts)
+					if !errors.As(err, &InsufficientWriteQuorum{}) {
+						t.Errorf("%s overwrite with the other pool full: got %v, want InsufficientWriteQuorum", full, err)
+					}
+					_, err = z.NewMultipartUpload(t.Context(), bucket, full, opts)
+					if !errors.As(err, &InsufficientWriteQuorum{}) {
+						t.Errorf("%s multipart overwrite with the other pool full: got %v, want InsufficientWriteQuorum", full, err)
+					}
+				}()
+			}
+		})
 	}
 }
 
@@ -230,20 +323,7 @@ func TestPoolsMultipartOverwriteStaysInObjectPool(t *testing.T) {
 		object := fmt.Sprintf("multipart-%d", home)
 		putConsistencyObject(t, z, bucket, object, home, "v0", opts)
 		defer placementHomeCapacity(z, object, home, 90)()
-		mp, err := z.NewMultipartUpload(t.Context(), bucket, object, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		part, err := z.PutObjectPart(t.Context(), bucket, object, mp.UploadID, 1,
-			mustGetPutObjReader(t, bytes.NewBufferString("v1"), 2, "", ""), opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		oi, err := z.CompleteMultipartUpload(t.Context(), bucket, object, mp.UploadID,
-			[]CompletePart{{PartNumber: 1, ETag: part.ETag}}, opts)
-		if err != nil {
-			t.Fatal(err)
-		}
+		oi := placementMultipartPut(t, z, bucket, object, "v1", opts)
 		if got := placementPools(t, z, bucket, object, oi.VersionID); !slices.Equal(got, []int{home}) {
 			t.Errorf("%s multipart version is in pools %v, want [%d]", object, got, home)
 		}
