@@ -18,23 +18,29 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
+	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/bucket/versioning"
 	xhttp "github.com/minio/minio/internal/http"
 )
 
-// Decommission and rebalance leave a version that ILM expires to the expiry
-// workers. Expiring the current version of a versioned object only puts a
-// delete marker on top of it: the version stays as a noncurrent version and
-// has to be moved like any other. A version that ILM does delete is not moved,
-// and the source copies of the versions that were moved must still be removed.
+// Expiring the current version of a versioned object only puts a delete marker
+// on top of it: the version stays as a noncurrent version, and decommission
+// and rebalance have to move it like any other. A version that ILM deletes by
+// itself is deleted by the walk through the expiry path, which re-evaluates the
+// current rule, so it is not moved, and the source copies of the versions that
+// were moved are still removed. A deletion of every version of the object is
+// left to the expiry workers.
 
 // migrationILM is a bucket in pool 0 of two pools. The ILM expiry workers are
 // replaced by a queue that nothing drains, so the expiries a decommission or
@@ -120,11 +126,12 @@ func (m *migrationILM) marker(object, label string, mtime time.Time) {
 	m.track(object)
 }
 
-// tiered writes a version of object to pool 0 whose data is in a remote tier.
-func (m *migrationILM) tiered(object, label string) ObjectInfo {
+// tiered writes a version of object to pool 0 whose data is in a remote tier,
+// as the remote object "remote" of tier WARM. A zero mtime is now.
+func (m *migrationILM) tiered(object, label string, mtime time.Time) ObjectInfo {
 	m.t.Helper()
 	ctx := m.t.Context()
-	oi := m.put(object, label, ObjectOptions{Versioned: true})
+	oi := m.put(object, label, ObjectOptions{Versioned: true, MTime: mtime})
 	infos, errs := readAllFileInfo(ctx, m.z.serverPools[0].getHashedSet(object).getDisks(), "", m.bucket, object, oi.VersionID, false, false)
 	if errs[0] != nil {
 		m.t.Fatal(errs[0])
@@ -162,7 +169,6 @@ func (m *migrationILM) label(object, versionID string, deleted bool) string {
 // test fails unless a decommission completes. ILM has not caught up yet.
 func (m *migrationILM) move(kind string) {
 	m.t.Helper()
-	ctx := m.t.Context()
 	if kind == "rebalance" {
 		migrationTestWalk(m.t, m.z, m.bucket, 0, kind)
 		m.z.rebalMu.Lock()
@@ -170,17 +176,69 @@ func (m *migrationILM) move(kind string) {
 		m.z.rebalMu.Unlock()
 		return
 	}
+	info := m.decommission()
+	if !info.Complete || info.Failed || info.ItemsDecommissionFailed > 0 {
+		m.t.Fatalf("decommission did not complete: complete=%t failed=%t itemsFailed=%d; pool 0 holds %v",
+			info.Complete, info.Failed, info.ItemsDecommissionFailed, m.view(0))
+	}
+}
+
+// decommission runs a decommission of pool 0 as the admin API runs it, again
+// after a failed one, and returns its outcome.
+func (m *migrationILM) decommission() PoolDecommissionInfo {
+	m.t.Helper()
+	ctx := m.t.Context()
 	if err := m.z.StartDecommission(ctx, 0); err != nil {
 		m.t.Fatal(err)
 	}
 	m.z.doDecommissionInRoutine(ctx, 0)
 	m.z.poolMetaMutex.RLock()
-	info := *m.z.poolMeta.Pools[0].Decommission
-	m.z.poolMetaMutex.RUnlock()
-	if !info.Complete || info.Failed || info.ItemsDecommissionFailed > 0 {
-		m.t.Fatalf("decommission did not complete: complete=%t failed=%t itemsFailed=%d; pool 0 holds %v",
-			info.Complete, info.Failed, info.ItemsDecommissionFailed, m.view(0))
+	defer m.z.poolMetaMutex.RUnlock()
+	return *m.z.poolMeta.Pools[0].Decommission
+}
+
+// setConfig replaces the bucket's lifecycle rules (none if empty), or sets a
+// replication configuration, as the bucket APIs do.
+func (m *migrationILM) setConfig(lifecycleRules, replicationRules string) {
+	m.t.Helper()
+	meta, err := globalBucketMetadataSys.Get(m.bucket)
+	if err != nil {
+		m.t.Fatal(err)
 	}
+	meta.LifecycleConfigXML = nil
+	if lifecycleRules != "" {
+		meta.LifecycleConfigXML = []byte("<LifecycleConfiguration>" + lifecycleRules + "</LifecycleConfiguration>")
+	}
+	if replicationRules != "" {
+		meta.ReplicationConfigXML = []byte("<ReplicationConfiguration>" + replicationRules + "</ReplicationConfiguration>")
+	}
+	if err := meta.Save(m.t.Context(), m.z); err != nil {
+		m.t.Fatal(err)
+	}
+	globalBucketMetadataSys.Set(m.bucket, meta)
+}
+
+// stored returns the metadata of a version of object in a pool.
+func (m *migrationILM) stored(pool int, object, versionID string) (FileInfo, error) {
+	infos, errs := readAllFileInfo(m.t.Context(), m.z.serverPools[pool].getHashedSet(object).getDisks(), "", m.bucket, object, versionID, false, false)
+	return infos[0], errs[0]
+}
+
+// freeVersions returns the number of free versions of each object in a pool.
+func (m *migrationILM) freeVersions(pool int) map[string]int {
+	m.t.Helper()
+	free := map[string]int{}
+	for _, set := range m.z.serverPools[pool].sets {
+		err := set.listObjectsToDecommission(m.t.Context(), decomBucketInfo{Name: m.bucket}, func(entry metaCacheEntry) {
+			if fivs, err := entry.fileInfoVersions(m.bucket); err == nil && len(fivs.FreeVersions) > 0 {
+				free[entry.name] = len(fivs.FreeVersions)
+			}
+		})
+		if err != nil {
+			m.t.Fatal(err)
+		}
+	}
+	return free
 }
 
 // migrate moves the contents of pool 0 out and lets ILM catch up.
@@ -305,6 +363,11 @@ func migrationILMRule(action string) string {
 	return "<Rule><ID>rule</ID><Status>Enabled</Status><Filter><Prefix>obj-</Prefix></Filter>" + action + "</Rule>"
 }
 
+// migrationILMNoncurrent expires versions that have been noncurrent for a day.
+func migrationILMNoncurrent() string {
+	return migrationILMRule("<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration>")
+}
+
 // migrationILMExpireCurrent expires the current versions at a past date (S3
 // expiration dates are midnights).
 func migrationILMExpireCurrent() string {
@@ -361,14 +424,15 @@ func testMigrationLifecycleExpiry(t *testing.T, kind string) {
 		m.check(map[string][]string{"obj-01": {"DM", "v3", "v2", "v1"}, "obj-null": {"DM", "v1"}})
 	})
 
-	// v1 has been noncurrent for four days and is deleted by the queued
-	// expiry. The source copies of v2 and v3 must be removed although v1 has
-	// not been deleted yet.
+	// v1 has been noncurrent for four days. The walk has the expiry delete it,
+	// queues nothing, and removes the source copies of v2 and v3.
 	t.Run("versioned/noncurrent-expiration", func(t *testing.T) {
-		m := newMigrationILM(t, versioning.Enabled, false,
-			migrationILMRule("<NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration>"))
+		m := newMigrationILM(t, versioning.Enabled, false, migrationILMNoncurrent())
 		m.aged(0, "obj-01", "keep-01")
-		m.migrate(kind)
+		m.move(kind)
+		if n := len(m.queue); n != 0 {
+			t.Errorf("%d expiries were queued, want none", n)
+		}
 		m.check(map[string][]string{"obj-01": {"v3", "v2"}, "keep-01": {"v3", "v2", "v1"}})
 	})
 
@@ -426,7 +490,7 @@ func TestPoolsDecommissionLifecycleExpiry(t *testing.T) {
 		m := newMigrationILM(t, versioning.Enabled, false, migrationILMExpireCurrent())
 		m.put("obj-01", "v1", ObjectOptions{Versioned: true})
 		m.put("obj-01", "v2", ObjectOptions{Versioned: true})
-		v3 := m.tiered("obj-01", "v3")
+		v3 := m.tiered("obj-01", "v3", time.Time{})
 		m.migrate("decommission")
 		m.check(map[string][]string{"obj-01": {"v3", "v2", "v1"}})
 		oi, err := m.z.serverPools[1].GetObjectInfo(t.Context(), m.bucket, "obj-01", ObjectOptions{VersionID: v3.VersionID})
@@ -448,9 +512,219 @@ func TestPoolsDecommissionCountsExpiredCurrentVersions(t *testing.T) {
 	}
 }
 
+// A version that ILM deletes by itself is deleted by the walk or moved. The
+// check after decommission must count one still in the pool, rather than leave
+// it to the removal of the pool on the check's own decision, and must not
+// delete it either.
+func TestPoolsDecommissionCountsVersionsDueForDeletion(t *testing.T) {
+	m := newMigrationILM(t, "", false, migrationILMExpireCurrent())
+	m.migrate("decommission")
+	putConsistencyObject(t, m.z, m.bucket, "obj-01", 0, "null", ObjectOptions{})
+	if err := m.z.checkAfterDecom(t.Context(), 0); err == nil {
+		t.Fatal("decommission check passed with a version due for deletion left in the pool")
+	}
+	if _, err := m.stored(0, "obj-01", ""); err != nil {
+		t.Errorf("the check deleted the version: %v", err)
+	}
+	if n := len(m.queue); n != 0 {
+		t.Errorf("%d expiries were queued, want none", n)
+	}
+}
+
 // Rebalance removes the source copies of an object only when it has counted
 // all of its versions. A version that ILM deletes must be counted, or the
 // moved versions stay in pool 0 as duplicates.
 func TestPoolsRebalanceLifecycleExpiry(t *testing.T) {
 	testMigrationLifecycleExpiry(t, "rebalance")
+}
+
+// versionID returns the version ID of the version of object with label.
+func (m *migrationILM) versionID(object, label string) string {
+	m.t.Helper()
+	for key, l := range m.labels {
+		if id, ok := strings.CutPrefix(key, object+" "); ok && l == label {
+			return id
+		}
+	}
+	m.t.Fatalf("no version %s of %s", label, object)
+	return ""
+}
+
+// The walk decides with the lifecycle it loaded when it started on the bucket.
+// The deletion applies the rule as it is when it runs: a version whose rule was
+// removed or relaxed in between is not deleted, and the walk moves it instead.
+func TestExpireMovingVersionRechecksLifecycle(t *testing.T) {
+	for _, tc := range []struct{ name, rules string }{
+		{"rule-removed", ""},
+		{"rule-relaxed", migrationILMRule("<NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays></NoncurrentVersionExpiration>")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMigrationILM(t, versioning.Enabled, false, migrationILMNoncurrent())
+			m.aged(0, "obj-01")
+			ctx := t.Context()
+			v1, err := m.z.serverPools[0].GetObjectInfo(ctx, m.bucket, "obj-01", ObjectOptions{VersionID: m.versionID("obj-01", "v1")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			lc, err := globalLifecycleSys.Get(m.bucket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			evt := evalActionFromLifecycle(ctx, *lc, objectlock.Retention{}, nil, v1)
+			if evt.Action != lifecycle.DeleteVersionAction {
+				t.Fatalf("v1 is not due: %s", evt.Action)
+			}
+
+			m.setConfig(tc.rules, "")
+			if expireMovingVersion(ctx, m.z, v1, evt, lcEventSrc_Decom) {
+				t.Fatal("v1 was deleted on the earlier decision")
+			}
+			m.migrate("decommission")
+			m.check(map[string][]string{"obj-01": {"v3", "v2", "v1"}})
+		})
+	}
+}
+
+// With replication configured, ILM leaves a version alone while its purge waits
+// to be replicated, and the walk moves it with its purge state, so replication
+// can still complete. A noncurrent version that is due without a pending purge
+// is deleted through the expiry path, as the scanner deletes it, and nothing is
+// queued.
+func TestPoolsMigrationLifecycleExpiryWithReplication(t *testing.T) {
+	arn := "arn:minio:replication::" + mustGetUUID() + ":target"
+	replicationRules := "<Role></Role><Rule><ID>repl</ID><Status>Enabled</Status><Priority>1</Priority>" +
+		"<DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>" +
+		"<DeleteReplication><Status>Enabled</Status></DeleteReplication>" +
+		"<Filter><Prefix></Prefix></Filter><Destination><Bucket>" + arn + "</Bucket></Destination></Rule>"
+	for _, kind := range []string{"decommission", "rebalance"} {
+		t.Run(kind, func(t *testing.T) {
+			m := newMigrationILM(t, versioning.Enabled, false, migrationILMNoncurrent())
+			m.setConfig(migrationILMNoncurrent(), replicationRules)
+			m.aged(0, "obj-01", "obj-02")
+			v1 := m.versionID("obj-02", "v1")
+			_, err := m.z.serverPools[0].DeleteObject(t.Context(), m.bucket, "obj-02", ObjectOptions{
+				Versioned: true, VersionID: v1,
+				DeleteReplication: ReplicationState{
+					VersionPurgeStatusInternal: arn + "=PENDING;",
+					PurgeTargets:               map[string]VersionPurgeStatusType{arn: replication.VersionPurgePending},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.markers[m.key("obj-02", v1)] = "v1-purge-pending"
+
+			m.move(kind)
+			if n := len(m.queue); n != 0 {
+				t.Errorf("%d expiries were queued, want none", n)
+			}
+			m.check(map[string][]string{"obj-01": {"v3", "v2"}, "obj-02": {"v3", "v2", "v1-purge-pending"}})
+			if fi, err := m.stored(1, "obj-02", v1); err != nil || fi.VersionPurgeStatus() != replication.VersionPurgePending {
+				t.Errorf("v1 of obj-02 in pool 1: purge status %q, %v", fi.VersionPurgeStatus(), err)
+			}
+		})
+	}
+}
+
+// migrationILMTier is a remote tier held in memory whose removals can fail.
+type migrationILMTier struct {
+	tierExpiryTestBackend
+	fail atomic.Bool
+}
+
+func (b *migrationILMTier) Remove(ctx context.Context, object string, rv remoteVersionID) error {
+	if b.fail.Load() {
+		return errors.New("tier unavailable")
+	}
+	return b.tierExpiryTestBackend.Remove(ctx, object, rv)
+}
+
+func (b *migrationILMTier) has(object string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, ok := b.objects[object]
+	return ok
+}
+
+// A transitioned noncurrent version that ILM deletes during a decommission
+// keeps its remote object recorded in the pool until the tier has removed it.
+// When the tier fails, the expiry leaves a free version behind, and the
+// decommission does not complete. Run again once the tier works, it removes
+// the remote object and then the free version. Only the free version on the
+// drives carries the remote object from one run to the next, as across a
+// restart.
+func TestPoolsDecommissionLifecycleExpiryTierFailure(t *testing.T) {
+	m := newMigrationILM(t, versioning.Enabled, false, migrationILMNoncurrent())
+	tier := &migrationILMTier{tierExpiryTestBackend: tierExpiryTestBackend{objects: map[string][]byte{"remote": []byte("v1")}}}
+	tier.fail.Store(true)
+	prevTier := globalTierConfigMgr
+	globalTierConfigMgr = NewTierConfigMgr()
+	globalTierConfigMgr.drivercache["WARM"] = tier
+	t.Cleanup(func() { globalTierConfigMgr = prevTier })
+
+	m.tiered("obj-01", "v1", UTCNow().AddDate(0, 0, -5))
+	m.put("obj-01", "v2", ObjectOptions{Versioned: true, MTime: UTCNow().AddDate(0, 0, -4)})
+	m.put("obj-01", "v3", ObjectOptions{Versioned: true})
+	m.versions(ObjectOptions{Versioned: true}, "keep-01")
+
+	if info := m.decommission(); info.Complete {
+		t.Fatal("decommission completed while the remote object of v1 was recorded only in pool 0")
+	}
+	if !tier.has("remote") {
+		t.Fatal("the remote object of v1 was removed while the tier failed")
+	}
+	if got := m.freeVersions(0); got["obj-01"] != 1 {
+		t.Fatalf("free versions in pool 0: %v, want one of obj-01", got)
+	}
+	if n := len(m.queue); n != 0 {
+		t.Errorf("%d expiries were queued, want none", n)
+	}
+
+	// A decommission start ensures the metadata buckets through the local
+	// drives of the node with one write quorum. This node holds both pools,
+	// and the first run emptied .minio.sys/buckets in pool 0, so creating it
+	// would split evenly between "created" and "exists". Pools on separate
+	// nodes do not meet this; recreate the directory in pool 0 for the retry.
+	for _, set := range m.z.serverPools[0].sets {
+		for _, disk := range set.getDisks() {
+			if err := disk.MakeVol(t.Context(), pathJoin(minioMetaBucket, bucketMetaPrefix)); err != nil && !errors.Is(err, errVolumeExists) {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	tier.fail.Store(false)
+	if info := m.decommission(); !info.Complete || info.Failed {
+		t.Fatalf("decommission did not complete once the tier worked: complete=%t failed=%t; free versions in pool 0: %v",
+			info.Complete, info.Failed, m.freeVersions(0))
+	}
+	if tier.has("remote") {
+		t.Error("the remote object of v1 was not removed")
+	}
+	if got := m.freeVersions(0); len(got) > 0 {
+		t.Errorf("free versions left in pool 0: %v", got)
+	}
+	m.check(map[string][]string{"obj-01": {"v3", "v2"}, "keep-01": {"v3", "v2", "v1"}})
+}
+
+// Rebalance does not move transitioned versions yet. An object with one stays
+// in pool 0 with all its versions, and none of them is copied to pool 1, where
+// they would stay as duplicates of the source copies.
+func TestPoolsRebalanceLeavesObjectsWithTransitionedVersions(t *testing.T) {
+	m := newMigrationILM(t, versioning.Enabled, false, migrationILMNoncurrent())
+	m.put("obj-01", "v1", ObjectOptions{Versioned: true, MTime: UTCNow().AddDate(0, 0, -5)})
+	m.tiered("obj-01", "v2", UTCNow().AddDate(0, 0, -4))
+	m.put("obj-01", "v3", ObjectOptions{Versioned: true})
+	m.versions(ObjectOptions{Versioned: true}, "keep-01")
+
+	m.move("rebalance")
+	if got := m.view(0); len(got) != 1 || !slices.Equal(got["obj-01"], []string{"v3", "v2", "v1"}) {
+		t.Errorf("pool 0 holds %v, want all versions of obj-01 only", got)
+	}
+	if got := m.view(1); got["obj-01"] != nil || !slices.Equal(got["keep-01"], []string{"v3", "v2", "v1"}) {
+		t.Errorf("pool 1 holds %v, want keep-01 only", got)
+	}
+	if n := len(m.queue); n != 0 {
+		t.Errorf("%d expiries were queued, want none", n)
+	}
 }

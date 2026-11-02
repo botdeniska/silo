@@ -130,12 +130,7 @@ func (z *erasureServerPools) checkDataMovementCopies(ctx context.Context, bucket
 // removeMovedVersions retires only the source versions in the walker's
 // snapshot. A concurrent delete can create a new marker in the source pool;
 // deleting the whole prefix would remove that marker and expose moved data.
-// Versions in expired were not moved because ILM deletes them. They are
-// removed from the source without a moved copy, as the queued expiry would
-// remove them. Left behind, such a version can become the latest one in the
-// source pool once the moved versions are gone, and the expiry, which
-// re-evaluates the rule there, would no longer delete it.
-func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions, expired []FileInfo) error {
+func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo) error {
 	object = encodeDirObject(object)
 	lk := z.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
@@ -173,7 +168,7 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 		}
 		// Successful movement is not enough if the destination changed again.
 		// Keep the source unless another copy still preserves its read result.
-		if !isExpiredVersion(expired, version) && (len(retained) == 0 || retained[0].ObjInfo.ModTime.Before(src.ModTime)) {
+		if len(retained) == 0 || retained[0].ObjInfo.ModTime.Before(src.ModTime) {
 			return PreConditionFailed{}
 		}
 		_, err = z.serverPools[source].DeleteObject(ctx, bucket, object, ObjectOptions{
@@ -187,21 +182,31 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 	return nil
 }
 
-// ilmDeletesVersionOnly reports whether the ILM action queued for a version
-// that data movement skipped deletes that version and nothing else, rather
-// than every version of the object or only the restored copy of a
-// transitioned version. Such a version is passed to removeMovedVersions.
+// ilmDeletesVersionOnly reports whether an ILM deletion that data movement
+// finds due removes that version and nothing else, rather than every version
+// of the object or only the restored copy of a transitioned version. Callers
+// handle the expiry of a latest version that only adds a delete marker first.
 func ilmDeletesVersionOnly(action lifecycle.Action) bool {
 	return action == lifecycle.DeleteAction || action == lifecycle.DeleteVersionAction
 }
 
-func isExpiredVersion(expired []FileInfo, version FileInfo) bool {
-	for _, fi := range expired {
-		if fi.VersionID == version.VersionID && fi.ModTime.Equal(version.ModTime) && fi.Deleted == version.Deleted {
-			return true
-		}
+// expireMovingVersion applies an ILM deletion of a single version that data
+// movement finds due, synchronously and through the path the expiry workers
+// run. The object layer re-evaluates the bucket's current lifecycle on the
+// stored version under the object lock, the remote object of a transitioned
+// version is removed or kept as a free version for a later retry, and the
+// expiry is audited and notified as any other. It reports whether the
+// version was deleted. Otherwise the caller moves the version like any
+// other, and its expiry runs in the pool that receives it.
+//
+// Data movement must not remove such a version from the source itself: that
+// would act on the walker's earlier decision and drop the tier cleanup record,
+// the audit entry and the event of the expiry.
+func expireMovingVersion(ctx context.Context, z *erasureServerPools, oi ObjectInfo, evt lifecycle.Event, src lcEventSrc) bool {
+	if oi.TransitionedObject.Status != "" {
+		return applyExpiryOnTransitionedObject(ctx, z, oi, evt, src)
 	}
-	return false
+	return applyExpiryOnNonTransitionedObjects(ctx, z, oi, evt, src)
 }
 
 // Healing also commits object metadata. Both queued healing and drive healing

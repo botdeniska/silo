@@ -26,6 +26,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -587,11 +588,12 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 	}
 
 	for setIdx, set := range pool.sets {
-		// filterLifecycle returns the action of an ILM deletion it queued
-		// for the version, which is then not moved, or NoneAction.
-		filterLifecycle := func(bucket, object string, fi FileInfo) lifecycle.Action {
+		// filterLifecycle reports whether ILM takes the version, which is then
+		// not moved: it is deleted already, or goes with all versions of the
+		// object once the queued expiry runs.
+		filterLifecycle := func(bucket, object string, fi FileInfo) bool {
 			if lc == nil {
-				return lifecycle.NoneAction
+				return false
 			}
 			versioned := vc != nil && vc.Versioned(object)
 			objInfo := fi.ToObjectInfo(bucket, object, versioned)
@@ -602,13 +604,15 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 				// Expiring the latest version of a versioned bucket only puts
 				// a delete marker on top of it. The version itself survives as
 				// a noncurrent version and has to be moved like any other. The
-				// scanner applies the expiry once it lives in another pool.
-				return lifecycle.NoneAction
+				// expiry applies in the pool that receives it.
+				return false
+			case ilmDeletesVersionOnly(evt.Action):
+				return expireMovingVersion(ctx, z, objInfo, evt, lcEventSrc_Rebal)
 			case evt.Action.Delete():
 				globalExpiryState.enqueueByDays(objInfo, evt, lcEventSrc_Rebal)
-				return evt.Action
+				return true
 			}
-			return lifecycle.NoneAction
+			return false
 		}
 
 		rebalanceEntry := func(entry metaCacheEntry) {
@@ -628,31 +632,29 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 				return
 			}
 
+			// Rebalance does not move transitioned versions yet. An object
+			// with one stays in this pool with all its versions: its source
+			// copies are only removed once every version has moved, so moving
+			// the others would leave them behind as duplicates.
+			if slices.ContainsFunc(fivs.Versions, FileInfo.IsRemote) {
+				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceObject, poolIdx, bucket, entry.name, "")
+				stopFn(0, errors.New("ILM Tiered object will be skipped for now"))
+				return
+			}
+
 			// We need a reversed order for rebalance,
 			// to create the appropriate stack.
 			versionsSorter(fivs.Versions).reverse()
 
 			var rebalanced int
-			var expired []FileInfo
 			for _, version := range fivs.Versions {
 				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceObject, poolIdx, bucket, version.Name, version.VersionID)
 
-				// Skip transitioned objects for now. TBD
-				if version.IsRemote() {
-					stopFn(version.Size, errors.New("ILM Tiered version will be skipped for now"))
-					continue
-				}
-
-				// Apply lifecycle rules on the objects that are expired.
-				if action := filterLifecycle(bucket, version.Name, version); action.Delete() {
-					// Count the version, or the source copies of the moved
-					// ones stay behind as duplicates. Its own source copy
-					// goes with them when ILM deletes it alone; any other
-					// version stays until the expiry has run.
+				// Apply lifecycle rules on the objects that are expired. The
+				// version counts, or the source copies of the moved versions
+				// would stay behind as duplicates.
+				if filterLifecycle(bucket, version.Name, version) {
 					rebalanced++
-					if ilmDeletesVersionOnly(action) {
-						expired = append(expired, version)
-					}
 					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue
 				}
@@ -761,7 +763,7 @@ func (z *erasureServerPools) rebalanceBucket(ctx context.Context, bucket string,
 			// if all versions were rebalanced, we can delete the object versions.
 			if rebalanced == len(fivs.Versions) {
 				stopFn := globalRebalanceMetrics.log(rebalanceMetricRebalanceRemoveObject, poolIdx, bucket, entry.name)
-				err := z.removeMovedVersions(ctx, bucket, entry.name, poolIdx, fivs.Versions, expired)
+				err := z.removeMovedVersions(ctx, bucket, entry.name, poolIdx, fivs.Versions)
 				stopFn(0, err)
 				auditLogRebalance(ctx, "Rebalance:DeleteObject", bucket, entry.name, "", err)
 				if err != nil {
